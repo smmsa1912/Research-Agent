@@ -12,6 +12,7 @@ from app.agent import ResearchAgent
 from app.config import Settings
 from app.llm import OpenAICompatibleProvider
 from app.sources import SourceStore
+from app.terminal import TerminalSpinner
 from app.tools import ToolContext, build_default_registry
 
 
@@ -49,10 +50,10 @@ def main() -> None:
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         model=settings.llm_model,
-        timeout=settings.request_timeout,
+        timeout=settings.llm_timeout,
     )
     sources = SourceStore()
-    with httpx.Client(timeout=settings.request_timeout) as http:
+    with httpx.Client(timeout=httpx.Timeout(settings.request_timeout, connect=15.0)) as http:
         context = ToolContext(
             http=http,
             sources=sources,
@@ -69,6 +70,11 @@ def main() -> None:
         print("Research Agent")
         print(f"Model: {settings.llm_model}")
         print("Provider endpoint: configured via LLM_BASE_URL")
+        print(f"LLM response timeout: {settings.llm_timeout:g}s")
+        print(
+            f"Research budget: up to {settings.max_tool_rounds} model/tool rounds "
+            "(the agent can finish earlier)."
+        )
         print("Type :help for commands or :quit to exit.\n")
 
         try:
@@ -94,7 +100,8 @@ def main() -> None:
                     continue
 
                 try:
-                    result = agent.ask(prompt)
+                    with TerminalSpinner("Starting research") as progress:
+                        result = agent.ask(prompt, on_progress=progress.update)
                 except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                     print(f"\nAgent error: {exc}\n")
                     continue
@@ -106,7 +113,9 @@ def main() -> None:
                 else:
                     print("Tools used: none (the model answered without invoking a tool).")
                 if result.stopped_at_limit:
-                    print("Note: the tool-call limit was reached; this is a best-effort synthesis.")
+                    print("Note: the research safety ceiling was reached; the agent synthesized the evidence collected.")
+                if result.degraded:
+                    print("Note: the provider timed out during research. The agent recovered with a smaller synthesis or an evidence-only report.")
                 if result.sources:
                     report_path = save_report(result.content)
                     print(f"Report saved to: {report_path.relative_to(ROOT)}\n")

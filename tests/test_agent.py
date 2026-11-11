@@ -21,7 +21,10 @@ class FakeProvider:
         tools: Sequence[dict[str, Any]],
     ) -> LLMResponse:
         self.requests.append((list(messages), list(tools)))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class ExampleSearchTool(ResearchTool):
@@ -229,3 +232,176 @@ def test_sources_from_previous_turn_remain_available_for_follow_up_citations() -
     assert "[S1]" in result.content
     assert "https://example.com/research" in result.content
     assert len(result.sources) == 1
+
+
+def test_agent_reports_progress_for_model_and_tool_steps() -> None:
+    provider = FakeProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall("call-1", "example_search", {"query": "progress"})
+                ]
+            ),
+            LLMResponse(content="The result is useful. [S1]"),
+        ]
+    )
+    agent, _, http = make_agent(provider)
+    updates: list[str] = []
+    try:
+        agent.ask("Research and report progress.", on_progress=updates.append)
+    finally:
+        http.close()
+
+    assert any("Thinking" in update for update in updates)
+    assert "Running tool: example_search" in updates
+    assert any("final response" in update for update in updates)
+
+
+def test_agent_can_finish_early_without_using_the_full_round_budget() -> None:
+    provider = FakeProvider([LLMResponse(content="A concise answer without searching.")])
+    agent, _, http = make_agent(provider, max_tool_rounds=12)
+    try:
+        result = agent.ask("What is a software agent?")
+    finally:
+        http.close()
+
+    assert result.tool_rounds == 0
+    assert result.stop_reason == "model_finished"
+    assert result.stopped_at_limit is False
+
+
+def test_agent_can_continue_beyond_seven_rounds_until_model_finishes() -> None:
+    responses = [
+        LLMResponse(
+            tool_calls=[
+                ToolCall(f"call-{index}", "example_search", {"query": f"topic {index}"})
+            ]
+        )
+        for index in range(1, 9)
+    ]
+    responses.append(LLMResponse(content="A synthesized answer after eight research rounds. [S1]"))
+    provider = FakeProvider(responses)
+    agent, _, http = make_agent(provider, max_tool_rounds=12)
+    try:
+        result = agent.ask("Research a broad topic.")
+    finally:
+        http.close()
+
+    assert result.tool_rounds == 8
+    assert result.stopped_at_limit is False
+    assert result.stop_reason == "model_finished"
+
+
+def test_tool_limit_synthesis_uses_compact_prompt_not_full_tool_transcript() -> None:
+    provider = FakeProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall("call-1", "example_search", {"query": "compact evidence"})
+                ]
+            ),
+            LLMResponse(content="A best-effort synthesis. [S1]"),
+        ]
+    )
+    agent, _, http = make_agent(provider, max_tool_rounds=1)
+    try:
+        result = agent.ask("Research this and report.")
+    finally:
+        http.close()
+
+    synthesis_messages, synthesis_tools = provider.requests[-1]
+    assert synthesis_tools == []
+    assert len(synthesis_messages) == 2
+    assert "Collected source evidence" in synthesis_messages[-1]["content"]
+    assert "call-1" not in synthesis_messages[-1]["content"]
+    assert result.stopped_at_limit is True
+
+
+def test_agent_recovers_with_compact_synthesis_after_late_provider_timeout() -> None:
+    from app.llm import ProviderTimeoutError
+
+    provider = FakeProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall("call-1", "example_search", {"query": "timeout recovery"})
+                ]
+            ),
+            ProviderTimeoutError("fake timeout"),
+            LLMResponse(content="Recovered summary based on collected evidence. [S1]"),
+        ]
+    )
+    agent, _, http = make_agent(provider, max_tool_rounds=12)
+    try:
+        result = agent.ask("Research and cite this topic.")
+    finally:
+        http.close()
+
+    assert result.degraded is True
+    assert result.stop_reason == "recovered_after_provider_timeout"
+    assert "Recovered summary" in result.content
+    assert "https://example.com/research" in result.content
+
+
+def test_agent_returns_evidence_report_if_compact_synthesis_also_times_out() -> None:
+    from app.llm import ProviderTimeoutError
+
+    provider = FakeProvider(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall("call-1", "example_search", {"query": "timeout fallback"})
+                ]
+            ),
+            ProviderTimeoutError("fake timeout during finalization"),
+        ]
+    )
+    agent, _, http = make_agent(provider, max_tool_rounds=1)
+    try:
+        result = agent.ask("Research this topic.")
+    finally:
+        http.close()
+
+    assert result.degraded is True
+    assert result.stopped_at_limit is True
+    assert result.stop_reason == "tool_round_limit_and_synthesis_timeout"
+    assert "not a completed comparative analysis" in result.content
+    assert "https://example.com/research" in result.content
+
+
+def test_bounded_messages_compacts_old_tool_replies_and_keeps_recent_ones() -> None:
+    provider = FakeProvider([LLMResponse(content="done")])
+    agent, sources, http = make_agent(provider)
+    try:
+        sources.add(
+            title="Useful source",
+            url="https://example.com/useful",
+            snippet="Evidence snippet for the source index.",
+        )
+        agent.messages.append({"role": "user", "content": "A large research task"})
+        for index in range(10):
+            agent.messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"id": f"call-{index}", "type": "function", "function": {"name": "example_search", "arguments": "{}"}}],
+                    "content": None,
+                }
+            )
+            agent.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call-{index}",
+                    "name": "example_search",
+                    "content": '{"source_id":"S1","data":"' + ("x" * 6000) + '"}',
+                }
+            )
+        bounded = agent._bounded_messages()
+    finally:
+        http.close()
+
+    tool_messages = [message for message in bounded if message.get("role") == "tool"]
+    assert len(tool_messages) == 10
+    assert len(tool_messages[0]["content"]) < 600
+    assert len(tool_messages[-1]["content"]) > 5_000
+    assert any("Previously collected source index" in str(m.get("content")) for m in bounded)
+    assert sum(len(str(m.get("content") or "")) for m in bounded) < agent.MAX_REQUEST_CONTEXT_CHARS

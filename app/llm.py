@@ -57,6 +57,10 @@ class ProviderError(RuntimeError):
     """Raised when the configured language model cannot complete a request."""
 
 
+class ProviderTimeoutError(ProviderError):
+    """Raised when the provider does not return before the configured timeout."""
+
+
 class OpenAICompatibleProvider:
     """Thin HTTP adapter for providers with the OpenAI chat-completions shape."""
 
@@ -66,14 +70,23 @@ class OpenAICompatibleProvider:
         base_url: str,
         api_key: str,
         model: str,
-        timeout: float = 30.0,
+        timeout: float = 240.0,
         client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.timeout_seconds = float(timeout)
         self._owns_client = client is None
-        self.client = client or httpx.Client(timeout=timeout)
+        self.client = client or httpx.Client(
+            timeout=httpx.Timeout(
+                timeout=self.timeout_seconds,
+                connect=min(25.0, self.timeout_seconds),
+                read=self.timeout_seconds,
+                write=min(30.0, self.timeout_seconds),
+                pool=min(30.0, self.timeout_seconds),
+            )
+        )
 
     def complete(
         self,
@@ -98,6 +111,13 @@ class OpenAICompatibleProvider:
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=payload,
+                timeout=httpx.Timeout(
+                    timeout=self.timeout_seconds,
+                    connect=min(25.0, self.timeout_seconds),
+                    read=self.timeout_seconds,
+                    write=min(30.0, self.timeout_seconds),
+                    pool=min(30.0, self.timeout_seconds),
+                ),
             )
             response.raise_for_status()
             data = response.json()
@@ -105,6 +125,13 @@ class OpenAICompatibleProvider:
             body = exc.response.text[:800]
             raise ProviderError(
                 f"LLM request failed ({exc.response.status_code}): {body}"
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeoutError(
+                f"The LLM provider did not respond within {self.timeout_seconds:g} seconds "
+                f"(LLM_TIMEOUT={self.timeout_seconds:g}). This can happen when the model is "
+                "busy or the prompt is too large. The agent will preserve any sources already "
+                "collected and attempt a smaller final synthesis. If needed, try a smaller research query."
             ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Could not reach the LLM provider: {exc}") from exc

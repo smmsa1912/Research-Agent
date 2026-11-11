@@ -18,8 +18,12 @@ not prescribe a fixed search sequence.
 - Uses the machine's local clock for current-date, current-time, and relative-date
   questions when the model invokes the clock tool.
 - Produces Markdown research reports and saves sourced responses in `reports/`.
-- Stops after a configurable number of tool rounds and asks the model for a best-effort
-  synthesis instead of looping forever.
+- Lets the model decide when research is sufficient; a configurable maximum round count
+  is only a safety ceiling.
+- Compacts older tool results in large conversations and uses a shorter evidence packet
+  for final synthesis.
+- Recovers from late provider timeouts with a compact synthesis attempt or an explicit
+  evidence-only report, preserving sources already collected.
 
 ## Architecture
 
@@ -67,8 +71,9 @@ LLM_BASE_URL=https://your-provider.example/v1
 LLM_API_KEY=replace_with_your_api_key
 LLM_MODEL=replace_with_a_tool_calling_model
 TAVILY_API_KEY=
-REQUEST_TIMEOUT=30
-MAX_TOOL_ROUNDS=7
+REQUEST_TIMEOUT=45
+LLM_TIMEOUT=240
+MAX_TOOL_ROUNDS=12
 ```
 
 `LLM_BASE_URL` is the base URL; the application appends `/chat/completions`. Do not
@@ -142,3 +147,66 @@ your location or timezone from your account.
   independently prove that each cited source supports the nearby claim.
 - Conversation history is held in memory for the current CLI run; it is not a durable
   chat database.
+
+## Terminal progress indicator
+
+While a request is running, the CLI displays an animated terminal spinner with
+short status updates such as `Thinking and deciding what to do`, `Running tool:
+web_search`, and `Writing the final response and checking citations`. The indicator
+uses a simple ASCII animation for compatibility with Windows PowerShell. When
+output is non-interactive, it prints status changes as normal lines instead.
+
+
+### Terminal progress display
+
+The CLI shows a single-line animated progress indicator while the agent is working. Progress labels are clipped to the current terminal width to prevent carriage-return animation from wrapping and leaving duplicated fragments in Windows PowerShell. When output is redirected, progress updates are printed as normal log lines.
+
+
+## Troubleshooting slow model responses
+
+Long research prompts can require several model calls. The default `LLM_TIMEOUT=240` allows up to four minutes for each model response, while `REQUEST_TIMEOUT=45` applies to external research tools. See the sections below for the distinction between the adaptive research loop, its safety ceiling, and timeout recovery. The terminal spinner displays the current activity while the agent works.
+
+## How the research loop and round budget work
+
+The model decides when it has enough information. It can answer immediately with zero
+research rounds, use a few rounds, or continue searching across more rounds. The
+`MAX_TOOL_ROUNDS` value is only a safety ceiling; it is not a target and the agent does
+not deliberately use every round. The default is 12, and values from 1 to 30 are
+accepted. Increase it for broad investigations or lower it for quick lookups.
+
+A round means one model decision that returns one or more tool calls. It does not mean
+one individual search result. When the safety ceiling is reached, the agent asks for a
+final answer using a compact evidence packet rather than sending the entire tool-call
+transcript back to the model.
+
+To change the limits, edit the existing `.env` file (not just `.env.example`):
+
+```dotenv
+LLM_TIMEOUT=240
+MAX_TOOL_ROUNDS=12
+```
+
+`LLM_TIMEOUT` is the maximum wait for an individual model response. It is separate from
+`REQUEST_TIMEOUT`, which applies to external research websites. Existing `.env` files
+keep their old values when you update the code, so edit them manually if they still say
+`LLM_TIMEOUT=180` or `MAX_TOOL_ROUNDS=7`.
+
+## Large research requests and timeout recovery
+
+Tool results are kept as valid JSON but shortened before they are sent back to the model.
+If the active conversation becomes large, older tool replies are compacted and a short
+source index is supplied so the model can still cite earlier findings. The full transcript
+and source registry remain available to the running application.
+
+If a provider call times out after the agent has collected sources, the agent makes one
+smaller, tool-free synthesis request. If that also times out, it returns an evidence-only
+report with the collected titles, URLs, and snippets instead of discarding the research.
+That fallback is clearly labelled as incomplete; it is not presented as a finished
+comparative analysis. If the very first model request times out before any evidence is
+collected, the timeout is shown so the provider settings can be checked.
+
+A longer timeout cannot override a provider's own server-side generation limit, rate
+limit, account quota, or model availability. If timeouts continue, check the provider
+status, model identifier, endpoint, rate-limit responses, and the model's tool-calling
+support. A faster tool-calling model or provider may help more than continually raising
+the timeout.

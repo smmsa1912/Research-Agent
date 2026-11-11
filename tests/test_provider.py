@@ -83,3 +83,27 @@ def test_provider_sends_native_tool_definitions_and_auto_tool_choice() -> None:
 
     assert captured["tools"] == [schema]
     assert captured["tool_choice"] == "auto"
+
+
+def test_provider_reports_a_clear_timeout_message() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("model response timed out", request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), timeout=1.0)
+    provider = OpenAICompatibleProvider(
+        base_url="https://llm.example/v1",
+        api_key="test-key",
+        model="test-model",
+        client=client,
+    )
+    from app.llm import ProviderError
+
+    try:
+        try:
+            provider.complete([{"role": "user", "content": "Research"}], [])
+            assert False, "Expected ProviderError"
+        except ProviderError as exc:
+            assert "LLM_TIMEOUT" in str(exc)
+            assert "try a smaller research query" in str(exc)
+    finally:
+        client.close()
